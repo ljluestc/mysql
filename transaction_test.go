@@ -511,33 +511,3 @@ func isTransactionIDError(err error) bool {
 
 	return false
 }
-
-// Helper function to check if string contains substring (case-insensitive)
-func contains(s, substr string) bool {
-	if len(s) < len(substr) {
-		return false
-	}
-	
-	// Simple case-insensitive contains
-	for i := 0; i <= len(s)-len(substr); i++ {
-		match := true
-		for j := 0; j < len(substr); j++ {
-			if toLower(s[i+j]) != toLower(substr[j]) {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
-}
-
-// Helper function to convert character to lowercase
-func toLower(c byte) byte {
-	if c >= 'A' && c <= 'Z' {
-		return c + ('a' - 'A')
-	}
-	return c
-}

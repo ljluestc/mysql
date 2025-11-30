@@ -61,6 +61,59 @@ func (tm *TransactionManager) ExecuteInTransaction(ctx context.Context, fn func(
 	return nil
 }
 
+// Helper function to check if error is retryable
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	
+	errStr := err.Error()
+	retryableErrors := []string{
+		"deadlock",
+		"lock wait timeout",
+		"connection reset",
+		"server has gone away",
+	}
+
+	for _, retryableErr := range retryableErrors {
+		if contains(errStr, retryableErr) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Helper function to check if string contains substring (case-insensitive)
+func contains(s, substr string) bool {
+	if len(s) < len(substr) {
+		return false
+	}
+	
+	// Simple case-insensitive contains
+	for i := 0; i <= len(s)-len(substr); i++ {
+		match := true
+		for j := 0; j < len(substr); j++ {
+			if toLower(s[i+j]) != toLower(substr[j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+// Helper function to convert character to lowercase
+func toLower(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
+}
+
 // TestTransactionManagerExample demonstrates the transaction manager pattern
 func TestTransactionManagerExample(t *testing.T) {
 	db := createTestDBConnection(t)
