@@ -22,7 +22,7 @@ import (
 
 // TestTransactionIDOverflowBehavior tests transaction ID behavior under various conditions
 func TestTransactionIDOverflowBehavior(t *testing.T) {
-	db := createTestDBConnection(t)
+	db := createTransactionIDTestDBConnection(t)
 	defer db.Close()
 
 	// Create test table for transaction ID testing
@@ -383,7 +383,7 @@ func TestTransactionIDOverflowBehavior(t *testing.T) {
 
 // TestTransactionIDOverflowSimulation simulates transaction ID overflow scenarios
 func TestTransactionIDOverflowSimulation(t *testing.T) {
-	db := createTestDBConnection(t)
+	db := createTransactionIDTestDBConnection(t)
 	defer db.Close()
 
 	// Create table for overflow simulation
@@ -535,7 +535,7 @@ func TestTransactionIDOverflowSimulation(t *testing.T) {
 
 // BenchmarkTransactionIDGeneration benchmarks transaction ID generation performance
 func BenchmarkTransactionIDGeneration(b *testing.B) {
-	db := createBenchDBConnection(b)
+	db := createTransactionIDBenchDBConnection(b)
 	defer db.Close()
 
 	// Create benchmark table
@@ -587,8 +587,8 @@ func BenchmarkTransactionIDGeneration(b *testing.B) {
 	})
 }
 
-// createTestDBConnection creates a test database connection
-func createTestDBConnection(t *testing.T) *sql.DB {
+// createTransactionIDTestDBConnection creates a test database connection for transaction ID tests
+func createTransactionIDTestDBConnection(t *testing.T) *sql.DB {
 	dsn := "testuser:testpass@tcp(localhost:3306)/testdb?parseTime=true&timeout=30s&readTimeout=30s&writeTimeout=30s"
 	
 	db, err := sql.Open("mysql", dsn)
@@ -610,8 +610,8 @@ func createTestDBConnection(t *testing.T) *sql.DB {
 	return db
 }
 
-// createBenchDBConnection creates a benchmark database connection
-func createBenchDBConnection(b *testing.B) *sql.DB {
+// createTransactionIDBenchDBConnection creates a benchmark database connection for transaction ID tests
+func createTransactionIDBenchDBConnection(b *testing.B) *sql.DB {
 	dsn := "testuser:testpass@tcp(localhost:3306)/testdb?parseTime=true&timeout=30s&readTimeout=30s&writeTimeout=30s"
 	
 	db, err := sql.Open("mysql", dsn)
