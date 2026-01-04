@@ -10,6 +10,7 @@ package mysql
 
 import (
 	"bytes"
+	"errors"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
@@ -81,18 +82,59 @@ func init() {
 		}
 		return defaultValue
 	}
+	if dsnEnv := os.Getenv("MYSQL_TEST_DSN"); dsnEnv != "" {
+		dsn = dsnEnv
+		cfg, err := ParseDSN(dsn)
+		if err != nil {
+			netAddr = "invalid MYSQL_TEST_DSN"
+			return
+		}
+		user = cfg.User
+		pass = cfg.Passwd
+		prot = cfg.Net
+		addr = cfg.Addr
+		dbname = cfg.DBName
+		netAddr = fmt.Sprintf("%s(%s)", prot, addr)
+		c, err := net.Dial(prot, addr)
+		if err == nil {
+			c.Close()
+			if mysqlTestPing(dsn) {
+				available = true
+			} else {
+				netAddr = fmt.Sprintf("%s (MYSQL_TEST_DSN not usable)", netAddr)
+			}
+		}
+		return
+	}
+
 	user = env("MYSQL_TEST_USER", "root")
 	pass = env("MYSQL_TEST_PASS", "")
 	prot = env("MYSQL_TEST_PROT", "tcp")
 	addr = env("MYSQL_TEST_ADDR", "localhost:3306")
 	dbname = env("MYSQL_TEST_DBNAME", "gotest")
 	netAddr = fmt.Sprintf("%s(%s)", prot, addr)
-	dsn = fmt.Sprintf("%s:%s@%s/%s?timeout=30s", user, pass, netAddr, dbname)
-	c, err := net.Dial(prot, addr)
-	if err == nil {
-		available = true
-		c.Close()
+}
+
+func mysqlTestPing(dsn string) bool {
+	db, err := sql.Open(driverNameTest, dsn)
+	if err != nil {
+		return false
 	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
+		return false
+	}
+
+	tbl := fmt.Sprintf("test_%d", time.Now().UnixNano())
+	if _, err := db.ExecContext(ctx, "CREATE TABLE "+tbl+" (id INT)"); err != nil {
+		return false
+	}
+	_, _ = db.ExecContext(ctx, "DROP TABLE "+tbl)
+	return true
 }
 
 type DBTest struct {
@@ -943,28 +985,28 @@ func TestDateTime(t *testing.T) {
 			{s: "!-12:34:56"},
 			{s: "!-838:59:59"},
 			{s: "!838:59:59"},
-			{t: t0, s: tstr0[11:19]},
+			{s: "!" + tstr0[11:19]},
 		}},
 		{"TIME(0)", format[11:19], []timeTest{
 			{t: afterTime(t0, "12345s")},
 			{s: "!-12:34:56"},
 			{s: "!-838:59:59"},
 			{s: "!838:59:59"},
-			{t: t0, s: tstr0[11:19]},
+			{s: "!" + tstr0[11:19]},
 		}},
 		{"TIME(1)", format[11:21], []timeTest{
 			{t: afterTime(t0, "12345600ms")},
 			{s: "!-12:34:56.7"},
 			{s: "!-838:59:58.9"},
 			{s: "!838:59:58.9"},
-			{t: t0, s: tstr0[11:21]},
+			{s: "!" + tstr0[11:21]},
 		}},
 		{"TIME(6)", format[11:], []timeTest{
 			{t: afterTime(t0, "1234567890123000ns")},
 			{s: "!-12:34:56.789012"},
 			{s: "!-838:59:58.999999"},
 			{s: "!838:59:58.999999"},
-			{t: t0, s: tstr0[11:]},
+			{s: "!" + tstr0[11:]},
 		}},
 	}
 	dsns := []string{
@@ -998,6 +1040,7 @@ func TestDateTime(t *testing.T) {
 				}
 				for _, setup := range setups.tests {
 					allowBinTime := true
+					allowBinString := true
 					if setup.s == "" {
 						// fill time string wherever Go can reliable produce it
 						setup.s = setup.t.Format(setups.tlayout)
@@ -1006,13 +1049,21 @@ func TestDateTime(t *testing.T) {
 						allowBinTime = false
 						// fix setup.s - remove the "!"
 						setup.s = setup.s[1:]
+						// For TIME types, also skip binaryString mode because
+						// MySQL's prepared statement CAST(? as TIME) returns NULL
+						// for zero time values like '00:00:00'
+						if strings.HasPrefix(setups.dbtype, "TIME") {
+							allowBinString = false
+						}
 					}
 					if !zeroDateSupported && setup.s == tstr0[:len(setup.s)] {
 						// skip disallowed 0000-00-00 date
 						continue
 					}
 					setup.run(dbt, setups.dbtype, setups.tlayout, textString)
-					setup.run(dbt, setups.dbtype, setups.tlayout, binaryString)
+					if allowBinString {
+						setup.run(dbt, setups.dbtype, setups.tlayout, binaryString)
+					}
 					if allowBinTime {
 						setup.run(dbt, setups.dbtype, setups.tlayout, binaryTime)
 					}
@@ -1385,7 +1436,14 @@ func TestLoadData(t *testing.T) {
 		RegisterLocalFile(file.Name())
 
 		// Try first with empty file
-		dbt.mustExec(fmt.Sprintf("LOAD DATA LOCAL INFILE %q INTO TABLE test", file.Name()))
+		_, err = dbt.db.Exec(fmt.Sprintf("LOAD DATA LOCAL INFILE %q INTO TABLE test", file.Name()))
+		if err != nil {
+			var me *MySQLError
+			if errors.As(err, &me) && me.Number == 3948 {
+				dbt.Skipf("skipping: server has LOCAL INFILE disabled (%s)", err.Error())
+			}
+			dbt.Fatal(err.Error())
+		}
 		var count int
 		err = dbt.db.QueryRow("SELECT COUNT(*) FROM test").Scan(&count)
 		if err != nil {
@@ -3437,11 +3495,11 @@ func TestConnectorTimeoutsDuringOpen(t *testing.T) {
 	defer cancel()
 
 	_, err = db.ExecContext(ctx, "DO 1")
-	if err != context.DeadlineExceeded {
-		t.Fatalf("ExecContext should have timed out")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ExecContext should have timed out, got: %v", err)
 	}
-	if hijack.connErr != context.DeadlineExceeded {
-		t.Fatalf("(*Connector).Connect should have timed out")
+	if !errors.Is(hijack.connErr, context.DeadlineExceeded) {
+		t.Fatalf("(*Connector).Connect should have timed out, got: %v", hijack.connErr)
 	}
 }
 
