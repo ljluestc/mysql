@@ -10,6 +10,7 @@ package mysql
 
 import (
 	"bytes"
+	"database/sql/driver"
 	"errors"
 	"net"
 	"testing"
@@ -35,6 +36,7 @@ type mockConn struct {
 	writes        int
 	maxReads      int
 	maxWrites     int
+	writeErrors   map[int]error
 }
 
 func (m *mockConn) Read(b []byte) (n int, err error) {
@@ -58,6 +60,9 @@ func (m *mockConn) Write(b []byte) (n int, err error) {
 	}
 
 	m.writes++
+	if err := m.writeErrors[m.writes]; err != nil {
+		return 0, err
+	}
 	if m.maxWrites > 0 && m.writes > m.maxWrites {
 		return 0, errConnTooManyWrites
 	}
@@ -96,17 +101,128 @@ var _ net.Conn = new(mockConn)
 
 func newRWMockConn(sequence uint8) (*mockConn, *mysqlConn) {
 	conn := new(mockConn)
-	connector := newConnector(NewConfig())
+	cfg := NewConfig()
+	if err := cfg.normalize(); err != nil {
+		panic(err)
+	}
 	mc := &mysqlConn{
 		buf:              newBuffer(),
-		cfg:              connector.cfg,
-		connector:        connector,
+		cfg:              cfg,
 		netConn:          conn,
 		closech:          make(chan struct{}),
 		maxAllowedPacket: defaultMaxAllowedPacket,
 		sequence:         sequence,
 	}
 	return conn, mc
+}
+
+func TestWriteExecutePacketValidatesArgsBeforeWriting(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.maxAllowedPacket = 128
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 2}
+
+	err := stmt.writeExecutePacket([]driver.Value{
+		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes, large enough to use long data.
+		time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC),
+	})
+	if err == nil {
+		t.Fatal("expected invalid time error")
+	}
+	if got, want := err.Error(), "year is not in the range [1, 9999]: 10000"; got != want {
+		t.Fatalf("unexpected error: got %q, want %q", got, want)
+	}
+	if conn.writes != 0 {
+		t.Fatalf("unexpected writes before all arguments were validated: %d", conn.writes)
+	}
+	if mc.sequence != 42 {
+		t.Fatalf("packet sequence changed before all arguments were validated: got %d, want 42", mc.sequence)
+	}
+}
+
+func TestWriteExecutePacketValidatesSizeBeforeWriting(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.maxAllowedPacket = 16
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 2}
+
+	err := stmt.writeExecutePacket([]driver.Value{
+		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes, large enough to use long data.
+		int64(1),
+	})
+	if err != ErrPktTooLarge {
+		t.Fatalf("unexpected error: got %v, want %v", err, ErrPktTooLarge)
+	}
+	if conn.writes != 0 {
+		t.Fatalf("unexpected writes before packet size was validated: %d", conn.writes)
+	}
+	if mc.sequence != 42 {
+		t.Fatalf("packet sequence changed before packet size was validated: got %d, want 42", mc.sequence)
+	}
+}
+
+func TestWriteExecutePacketSendsLongDataBeforeExecute(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.maxAllowedPacket = 128
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 2}
+
+	err := stmt.writeExecutePacket([]driver.Value{
+		bytes.Repeat([]byte{'a'}, 64),         // 64 'a' bytes as a []byte long-data parameter.
+		string(bytes.Repeat([]byte{'b'}, 64)), // 64 'b' bytes as a string long-data parameter.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var commands []byte
+	for written := conn.written; len(written) > 0; {
+		packetLen := 4 + getUint24(written)
+		if packetLen > len(written) {
+			t.Fatalf("invalid packet length: got %d, remaining bytes %d", packetLen, len(written))
+		}
+		commands = append(commands, written[4]) // The command is the first byte after the packet header.
+		written = written[packetLen:]
+	}
+	if want := []byte{comStmtSendLongData, comStmtSendLongData, comStmtExecute}; !bytes.Equal(commands, want) {
+		t.Fatalf("unexpected command order: got %v, want %v", commands, want)
+	}
+}
+
+func TestWriteExecutePacketResetsStmtAfterLongDataError(t *testing.T) {
+	conn, mc := newRWMockConn(42)
+	mc.maxAllowedPacket = 128
+	stmt := mysqlStmt{mc: mc, id: 1, paramCount: 2}
+	conn.writeErrors = map[int]error{2: errors.New("long data write failed")}
+	conn.queuedReplies = [][]byte{{
+		0x07, 0x00, 0x00, 0x01, // Packet header: 7-byte payload, sequence 1.
+		iOK,        // OK packet header.
+		0x00,       // Zero affected rows.
+		0x00,       // Zero last insert ID.
+		0x02, 0x00, // SERVER_STATUS_AUTOCOMMIT.
+		0x00, 0x00, // Zero warnings.
+	}}
+
+	err := stmt.writeExecutePacket([]driver.Value{
+		bytes.Repeat([]byte{'a'}, 64), // 64 'a' bytes sent successfully as long data.
+		bytes.Repeat([]byte{'b'}, 64), // 64 'b' bytes whose long-data write fails.
+	})
+	if err != errBadConnNoWrite {
+		t.Fatalf("unexpected error: got %v, want %v", err, errBadConnNoWrite)
+	}
+
+	var commands []byte
+	for written := conn.written; len(written) > 0; {
+		packetLen := 4 + getUint24(written)
+		if packetLen > len(written) {
+			t.Fatalf("invalid packet length: got %d, remaining bytes %d", packetLen, len(written))
+		}
+		commands = append(commands, written[4]) // The command is the first byte after the packet header.
+		written = written[packetLen:]
+	}
+	if want := []byte{comStmtSendLongData, comStmtReset}; !bytes.Equal(commands, want) {
+		t.Fatalf("unexpected command order: got %v, want %v", commands, want)
+	}
+	if len(conn.data) != 0 {
+		t.Fatal("COM_STMT_RESET response was not consumed")
+	}
 }
 
 func TestReadPacketSingleByte(t *testing.T) {
@@ -353,5 +469,36 @@ func TestRegression801(t *testing.T) {
 		47, 85, 75, 109, 99, 51, 77, 50, 64}
 	if !bytes.Equal(authData, expectedAuthData) {
 		t.Errorf("expected authData '%v', got '%v'", expectedAuthData, authData)
+	}
+}
+
+// ColumnDefinition41 carries a two-byte collation ID, unlike the handshake.
+func TestReadColumnsCollation(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		collation    uint16
+		databaseType string
+	}{
+		{"binary", 63, "VARBINARY"},
+		{"utf8mb4_bg_0900_as_cs", 319, "VARCHAR"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, mc := newRWMockConn(0)
+			column := []byte{3, 'd', 'e', 'f', 0, 0, 0, 1, 'v', 0, 12,
+				byte(tc.collation), byte(tc.collation >> 8), 16, 0, 0, 0,
+				byte(fieldTypeVarString), byte(flagNotNULL), 0, 0, 0, 0}
+			conn.data = append([]byte{byte(len(column)), 0, 0, 0}, column...)
+			conn.data = append(conn.data, 5, 0, 0, 1, 0xfe, 0, 0, 2, 0)
+			columns, err := mc.readColumns(1, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := uint16(columns[0].charSet); got != tc.collation {
+				t.Errorf("collation = %d; want %d", got, tc.collation)
+			}
+			if got := columns[0].typeDatabaseName(); got != tc.databaseType {
+				t.Errorf("DatabaseTypeName = %s; want %s", got, tc.databaseType)
+			}
+		})
 	}
 }

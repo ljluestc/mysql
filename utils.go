@@ -227,7 +227,7 @@ func bToi(b byte) (int, error) {
 	return int(b - '0'), nil
 }
 
-func parseBinaryDateTime(num uint64, data []byte, loc *time.Location) (driver.Value, error) {
+func parseBinaryDateTime(num uint64, data []byte, loc *time.Location) (time.Time, error) {
 	switch num {
 	case 0:
 		return time.Time{}, nil
@@ -262,7 +262,7 @@ func parseBinaryDateTime(num uint64, data []byte, loc *time.Location) (driver.Va
 			loc,
 		), nil
 	}
-	return nil, fmt.Errorf("invalid DATETIME packet length %d", num)
+	return time.Time{}, fmt.Errorf("invalid DATETIME packet length %d", num)
 }
 
 func appendDateTime(buf []byte, t time.Time, timeTruncate time.Duration) ([]byte, error) {
@@ -330,7 +330,7 @@ func appendDateTime(buf []byte, t time.Time, timeTruncate time.Duration) ([]byte
 // zeroDateTime is used in formatBinaryDateTime to avoid an allocation
 // if the DATE or DATETIME has the zero value.
 // It must never be changed.
-// The current behavior depends on database/sql copying the result.
+// Callers must copy it before returning an owned byte slice.
 var zeroDateTime = []byte("0000-00-00 00:00:00.000000")
 
 const digits01 = "0123456789012345678901234567890123456789012345678901234567890123456789012345678901234567890123456789"
@@ -385,7 +385,7 @@ func appendMicrosecs(dst, src []byte, decimals int) []byte {
 	}
 }
 
-func formatBinaryDateTime(src []byte, length uint8) (driver.Value, error) {
+func formatBinaryDateTime(src []byte, length uint8) ([]byte, error) {
 	// length expects the deterministic length of the zero value,
 	// negative time and 100+ hours are automatically added if needed
 	if len(src) == 0 {
@@ -444,7 +444,7 @@ func formatBinaryDateTime(src []byte, length uint8) (driver.Value, error) {
 	return appendMicrosecs(dst, src[2:], int(length)-20), nil
 }
 
-func formatBinaryTime(src []byte, length uint8) (driver.Value, error) {
+func formatBinaryTime(src []byte, length uint8) ([]byte, error) {
 	// length expects the deterministic length of the zero value,
 	// negative time and 100+ hours are automatically added if needed
 	if len(src) == 0 {
@@ -625,108 +625,80 @@ func reserveBuffer(buf []byte, appendSize int) []byte {
 	return buf[:newSize]
 }
 
-// escapeBytesBackslash escapes []byte with backslashes (\)
-// This escapes the contents of a string (provided as []byte) by adding backslashes before special
-// characters, and turning others into specific escape sequences, such as
-// turning newlines into \n and null bytes into \0.
-// https://github.com/mysql/mysql-server/blob/mysql-5.7.5/mysys/charset.c#L823-L932
-func escapeBytesBackslash(buf, v []byte) []byte {
-	pos := len(buf)
-	buf = reserveBuffer(buf, len(v)*2)
+// Lookup table for backslash escapes (used for both string and bytes)
+var backslashEscapeTable [256]byte
 
-	for _, c := range v {
-		switch c {
-		case '\x00':
-			buf[pos+1] = '0'
-			buf[pos] = '\\'
-			pos += 2
-		case '\n':
-			buf[pos+1] = 'n'
-			buf[pos] = '\\'
-			pos += 2
-		case '\r':
-			buf[pos+1] = 'r'
-			buf[pos] = '\\'
-			pos += 2
-		case '\x1a':
-			buf[pos+1] = 'Z'
-			buf[pos] = '\\'
-			pos += 2
-		case '\'':
-			buf[pos+1] = '\''
-			buf[pos] = '\\'
-			pos += 2
-		case '"':
-			buf[pos+1] = '"'
-			buf[pos] = '\\'
-			pos += 2
-		case '\\':
-			buf[pos+1] = '\\'
-			buf[pos] = '\\'
-			pos += 2
-		default:
-			buf[pos] = c
-			pos++
-		}
-	}
-
-	return buf[:pos]
+func init() {
+	backslashEscapeTable['\x00'] = '0'
+	backslashEscapeTable['\n'] = 'n'
+	backslashEscapeTable['\r'] = 'r'
+	backslashEscapeTable['\x1a'] = 'Z'
+	backslashEscapeTable['\''] = '\''
+	backslashEscapeTable['"'] = '"'
+	backslashEscapeTable['\\'] = '\\'
 }
 
 // escapeStringBackslash is similar to escapeBytesBackslash but for string.
 func escapeStringBackslash(buf []byte, v string) []byte {
 	pos := len(buf)
-	buf = reserveBuffer(buf, len(v)*2)
-
-	for i := range len(v) {
+	buf = reserveBuffer(buf, len(v)*2+2)
+	buf[pos] = '\''
+	pos++
+	for i := 0; i < len(v); i++ {
 		c := v[i]
-		switch c {
-		case '\x00':
-			buf[pos+1] = '0'
+		if esc := backslashEscapeTable[c]; esc != 0 {
+			buf[pos+1] = esc
 			buf[pos] = '\\'
 			pos += 2
-		case '\n':
-			buf[pos+1] = 'n'
-			buf[pos] = '\\'
-			pos += 2
-		case '\r':
-			buf[pos+1] = 'r'
-			buf[pos] = '\\'
-			pos += 2
-		case '\x1a':
-			buf[pos+1] = 'Z'
-			buf[pos] = '\\'
-			pos += 2
-		case '\'':
-			buf[pos+1] = '\''
-			buf[pos] = '\\'
-			pos += 2
-		case '"':
-			buf[pos+1] = '"'
-			buf[pos] = '\\'
-			pos += 2
-		case '\\':
-			buf[pos+1] = '\\'
-			buf[pos] = '\\'
-			pos += 2
-		default:
+		} else {
 			buf[pos] = c
 			pos++
 		}
 	}
-
+	buf[pos] = '\''
+	pos++
 	return buf[:pos]
 }
 
-// escapeBytesQuotes escapes apostrophes in []byte by doubling them up.
-// This escapes the contents of a string by doubling up any apostrophes that
-// it contains. This is used when the NO_BACKSLASH_ESCAPES SQL_MODE is in
-// effect on the server.
-// https://github.com/mysql/mysql-server/blob/mysql-5.7.5/mysys/charset.c#L963-L1038
-func escapeBytesQuotes(buf, v []byte) []byte {
+// escapeBytesBackslash appends _binary'...' or '...' with backslash escaping for bytes.
+func escapeBytesBackslash(buf, v []byte, binary bool) []byte {
 	pos := len(buf)
-	buf = reserveBuffer(buf, len(v)*2)
+	if binary {
+		buf = reserveBuffer(buf, len(v)*2+9)
+		copy(buf[pos:], []byte("_binary'"))
+		pos += 8
+	} else {
+		buf = reserveBuffer(buf, len(v)*2+2)
+		buf[pos] = '\''
+		pos++
+	}
+	for _, c := range v {
+		if esc := backslashEscapeTable[c]; esc != 0 {
+			buf[pos+1] = esc
+			buf[pos] = '\\'
+			pos += 2
+		} else {
+			buf[pos] = c
+			pos++
+		}
+	}
+	buf[pos] = '\''
+	pos++
+	return buf[:pos]
+}
 
+// escapeBytesQuotes appends _binary'...' or '...' with single-quote escaping for bytes.
+func escapeBytesQuotes(buf, v []byte, binary bool) []byte {
+	pos := len(buf)
+	if binary {
+		buf = reserveBuffer(buf, len(v)*2+9)
+		copy(buf[pos:], []byte("_binary'"))
+		pos += 8
+	} else {
+		buf = reserveBuffer(buf, len(v)*2+2)
+		buf[pos] = '\''
+		pos++
+	}
 	for _, c := range v {
 		if c == '\'' {
 			buf[pos+1] = '\''
@@ -737,15 +709,17 @@ func escapeBytesQuotes(buf, v []byte) []byte {
 			pos++
 		}
 	}
-
+	buf[pos] = '\''
+	pos++
 	return buf[:pos]
 }
 
 // escapeStringQuotes is similar to escapeBytesQuotes but for string.
 func escapeStringQuotes(buf []byte, v string) []byte {
 	pos := len(buf)
-	buf = reserveBuffer(buf, len(v)*2)
-
+	buf = reserveBuffer(buf, len(v)*2+2)
+	buf[pos] = '\''
+	pos++
 	for i := range len(v) {
 		c := v[i]
 		if c == '\'' {
@@ -757,7 +731,8 @@ func escapeStringQuotes(buf []byte, v string) []byte {
 			pos++
 		}
 	}
-
+	buf[pos] = '\''
+	pos++
 	return buf[:pos]
 }
 
